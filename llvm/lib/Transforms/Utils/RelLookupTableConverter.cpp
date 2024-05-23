@@ -13,6 +13,8 @@
 
 #include "llvm/Transforms/Utils/RelLookupTableConverter.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/SimplifyQuery.h"
+#include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/IRBuilder.h"
@@ -20,6 +22,189 @@
 #include "llvm/IR/Module.h"
 
 using namespace llvm;
+
+static bool HasNonVisibleUses(const Value *V) {
+  for (const User *user : V->users()) {
+    if (const auto *gep = dyn_cast<GetElementPtrInst>(user)) {
+      for (const User *user : gep->users()) {
+        if (auto *load = dyn_cast<LoadInst>(user)) {
+          if (load->getType()->isPointerTy())
+            continue;  // Valid
+        }
+        // Anything but a load.
+        return true;
+      }
+    } else {
+      // Conservative approach - all other uses could lead to an escape of this
+      // global. This can be refined in the future.
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void MaybeReplaceWithRelativeOffset(Module &M, GlobalVariable &GV) {
+  // The global should look something like this:
+  //
+  //   @symbols = dso_local constant [3 x ptr] [ptr @.str, ptr @.str.1, ptr @.str.2], align 16
+  //
+  // This definition must be the one we know will persist at link/runtime.
+  if (!GV.hasExactDefinition()) {
+    return;
+  }
+
+  // We can't see usage in any other module, so we wouldn't be able to replace usage of this global there.
+  // But if we had LTO, then we can bump this up to just `isInterposable` and allow hidden visibility.
+  if (!GV.hasLocalLinkage())
+    return;
+
+  // Definitely don't operate on stuff like llvm.compiler.used.
+  if (GV.getName().starts_with("llvm."))
+    return;
+
+  const Constant *Initializer = GV.getInitializer();
+  if (!Initializer->getType()->isAggregateType())  {
+    return;
+  }
+
+  // We must be able to see all uses of it.
+  if (HasNonVisibleUses(&GV)) {
+    //llvm::errs() << "HasNonVisibleUses\n";
+    return;
+  }
+
+  //llvm::errs() << "Checking operands\n";
+  const size_t NumOperands = Initializer->getNumOperands();
+
+  // If there's no operands, the initializer is likely an aggregate of raw constant data.
+  if (NumOperands == 0)
+    return;
+
+  // All references in it must be non-interposabe.
+  // Only do the replacement if all of the contigu
+  for (size_t i = 0; i < NumOperands; ++i) {
+    Constant *Op = cast<Constant>(Initializer->getOperand(i));
+
+    // The element must be to another global.
+    auto *OperandGV = dyn_cast<GlobalValue>(Op);
+    if (!OperandGV) {
+      return;
+    }
+
+    bool DSOLocal = OperandGV->isDSOLocal() || OperandGV->isImplicitDSOLocal();
+    if (!DSOLocal)
+      return;
+
+    APInt Offset;
+    GlobalValue *GV2;
+    if (!IsConstantOffsetFromGlobal(Op, GV2, Offset, M.getDataLayout()))
+      return;
+  }
+
+  Type *IntPtrTy = M.getDataLayout().getIntPtrType(M.getContext());
+  Type *OffsetTy = Type::getInt32Ty(M.getContext());
+
+  // Construct the new type.
+  Type *ReplacementTy = [&]() -> Type *{
+    if (Initializer->getType()->isStructTy()) {
+      std::vector<Type *> ElemTys(NumOperands, OffsetTy);
+      return llvm::StructType::create(ElemTys);
+    } else if (Initializer->getType()->isArrayTy()) {
+      return llvm::ArrayType::get(OffsetTy, NumOperands);
+    }
+    llvm_unreachable("An aggregate type should be one of a struct or array");
+  }();
+
+  GlobalVariable *Replacement = new GlobalVariable(M, ReplacementTy, /*isConstant=*/true,
+      GV.getLinkage(), /*Initializer=*/nullptr);
+  Replacement->takeName(&GV);
+  Replacement->setUnnamedAddr(GV.getUnnamedAddr());
+  Replacement->setVisibility(GV.getVisibility());
+  Replacement->setAlignment(llvm::Align(4));  // Unconditional 4-byte alignment
+
+  Constant *ReplacementInit = [&]() -> Constant *{
+    std::vector<Constant *> members;
+    members.reserve(NumOperands);
+    for (size_t i = 0; i < NumOperands; ++i) {
+      Constant *OriginalMember = cast<Constant>(Initializer->getOperand(i));
+
+      // Take the offset.
+      Constant *Base = llvm::ConstantExpr::getPtrToInt(Replacement, IntPtrTy);
+      Constant *Target = llvm::ConstantExpr::getPtrToInt(OriginalMember, IntPtrTy);
+      Constant *Sub = llvm::ConstantExpr::getSub(Target, Base);
+      Constant *RelOffset = llvm::ConstantExpr::getTrunc(Sub, OffsetTy);
+
+      members.push_back(RelOffset);
+    }
+
+    if (Initializer->getType()->isStructTy()) {
+      return llvm::ConstantStruct::getAnon(members);
+    } else if (Initializer->getType()->isArrayTy()) {
+      return llvm::ConstantArray::get(cast<ArrayType>(ReplacementTy), members);
+    }
+    llvm_unreachable("An aggregate type should be one of a struct or array");
+  }();
+
+  Replacement->setInitializer(ReplacementInit);
+
+  // Rn, we only account for geps, loads, and stores.
+  for (User *user : GV.users()) {
+    if (auto *gep = dyn_cast<GetElementPtrInst>(user)) {
+      for (User *user : gep->users()) {
+        if (auto *load = dyn_cast<LoadInst>(user)) {
+          assert(gep->getOperand(0) == &GV);
+
+          BasicBlock *BB = gep->getParent();
+          IRBuilder<> Builder(BB);
+          Builder.SetInsertPoint(gep);
+
+          // 1. The global itself
+          // 2. The first index (which should be zero)
+          // 3. The actual offset from the start of the global.
+          Value *Offset;
+          if (gep->getNumOperands() == 3) {
+            // Convert to offset in bytes.
+            Offset = gep->getOperand(2);
+            Offset = Builder.CreateShl(Offset, ConstantInt::get(Offset->getType(), 2));
+          } else if (gep->getNumOperands() == 2) {
+            assert(gep->getSourceElementType()->isIntegerTy(8) && "Unhandled source element type");;
+            Offset = gep->getOperand(1);
+          } else {
+            GV.dump();
+            gep->dump();
+            gep->getParent()->getParent()->dump();
+            assert(0 && "unhandled gep operand count");
+          }
+
+          Function *LoadRelIntrinsic = llvm::Intrinsic::getDeclaration(
+              &M, Intrinsic::load_relative, {Offset->getType()});
+          
+          Builder.SetInsertPoint(load);
+          Value *RelLoad = Builder.CreateCall(LoadRelIntrinsic, {&GV, Offset},
+                                               "reltable.intrinsic");
+          if (load->getType() != RelLoad->getType()) {
+            llvm::errs() << "Differing types\n";
+            gep->getOperand(0)->dump();
+            gep->dump();
+            load->dump();
+            RelLoad->dump();
+          }
+          load->replaceAllUsesWith(RelLoad);
+        } else {
+          llvm_unreachable("Unhandled use for GV");
+        }
+      }
+    } else {
+      llvm_unreachable("Unhandled use for GV");
+    }
+  }
+
+
+  llvm::errs() << "Replaced " << Replacement->getName() << ": "; GV.dump();
+  GV.replaceAllUsesWith(Replacement);
+  GV.eraseFromParent();
+}
 
 static bool shouldConvertToRelLookupTable(Module &M, GlobalVariable &GV) {
   // If lookup table has more than one user,
@@ -184,8 +369,10 @@ static bool convertToRelativeLookupTables(
   bool Changed = false;
 
   for (GlobalVariable &GV : llvm::make_early_inc_range(M.globals())) {
-    if (!shouldConvertToRelLookupTable(M, GV))
+    if (!shouldConvertToRelLookupTable(M, GV)) {
+      MaybeReplaceWithRelativeOffset(M, GV);
       continue;
+    }
 
     convertToRelLookupTable(GV);
 
