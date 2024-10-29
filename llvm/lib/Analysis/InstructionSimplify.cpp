@@ -19,6 +19,7 @@
 #include "llvm/Analysis/InstructionSimplify.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
@@ -6211,6 +6212,57 @@ static Value *simplifyRelativeLoad(Constant *Ptr, Constant *Offset,
   return LoadedLHSPtr;
 }
 
+static constexpr std::string_view Prefix("OUTLINED_");
+
+static Value *simplifyFixedPointOp(CallBase *Call, Function *F, Value *LHS, Value *RHS,
+                                   ConstantInt *Scale, Intrinsic::ID IID) {
+  Module &M = *F->getParent();
+  LLVMContext &Ctx = F->getContext();
+  IntegerType *Ty = cast<IntegerType>(LHS->getType());
+  FunctionType *OutlinedFuncType = FunctionType::get(Ty, {Ty, Ty}, /*isVarArg=*/false);
+
+  std::string Name(Prefix);
+  switch (IID) {
+    case Intrinsic::smul_fix:
+      Name += "smul_fix_";
+      break;
+    case Intrinsic::smul_fix_sat:
+      Name += "smul_fix_sat_";
+      break;
+    case Intrinsic::sdiv_fix:
+      Name += "sdiv_fix_";
+      break;
+    case Intrinsic::sdiv_fix_sat:
+      Name += "sdiv_fix_sat_";
+      break;
+    default:
+      __builtin_trap();
+  }
+  Name += utostr(Ty->getBitWidth());
+  Name += "_";
+  Name += utostr(Scale->getZExtValue());
+
+  Function *OutlinedFunc = M.getFunction(Name);
+  if (!OutlinedFunc) {
+    OutlinedFunc = Function::Create(OutlinedFuncType, GlobalValue::ExternalLinkage, Name, M);
+
+    OutlinedFunc->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    OutlinedFunc->addFnAttr(Attribute::OptimizeForSize);
+    OutlinedFunc->addFnAttr(Attribute::MinSize);
+    OutlinedFunc->setDSOLocal(true);
+    OutlinedFunc->setComdat(M.getOrInsertComdat(Name));
+    OutlinedFunc->setVisibility(GlobalValue::HiddenVisibility);
+
+    BasicBlock *BB = BasicBlock::Create(Ctx, "entry", OutlinedFunc);
+    IRBuilder<> Builder(BB);
+
+    Value *Ret = Builder.CreateIntrinsic(IID, {Ty}, {OutlinedFunc->getArg(0), OutlinedFunc->getArg(1), Scale});
+    Builder.CreateRet(Ret);
+  }
+
+  return CallInst::Create(OutlinedFuncType, OutlinedFunc, {LHS, RHS}, "", Call->getIterator());
+}
+
 // TODO: Need to pass in FastMathFlags
 static Value *simplifyLdexp(Value *Op0, Value *Op1, const SimplifyQuery &Q,
                             bool IsStrict) {
@@ -6887,6 +6939,15 @@ static Value *simplifyIntrinsic(CallBase *Call, Value *Callee,
     if (ScaledOne.isNonNegative() && match(Op1, m_SpecificInt(ScaledOne)))
       return Op0;
 
+    if (!Call->getParent()->getParent()->getName().starts_with(Prefix))
+      return simplifyFixedPointOp(Call, F, Op0, Op1, cast<ConstantInt>(Op2), IID);
+
+    return nullptr;
+  }
+  case Intrinsic::sdiv_fix:
+  case Intrinsic::sdiv_fix_sat: {
+    if (!Call->getParent()->getParent()->getName().starts_with(Prefix))
+      return simplifyFixedPointOp(Call, F, Args[0], Args[1], cast<ConstantInt>(Args[2]), IID);
     return nullptr;
   }
   case Intrinsic::vector_insert: {
