@@ -2973,6 +2973,10 @@ static LValue EmitFunctionDeclLValue(CodeGenFunction &CGF, const Expr *E,
                                      GlobalDecl GD) {
   const FunctionDecl *FD = cast<FunctionDecl>(GD.getDecl());
   llvm::Constant *V = CGF.CGM.getFunctionPointer(GD);
+  if (E->getType()->hasAttr(attr::CFIUncheckedCallee)) {
+    if (auto *GV = dyn_cast<llvm::GlobalValue>(V))
+      V = llvm::NoCFIValue::get(GV);
+  }
   CharUnits Alignment = CGF.getContext().getDeclAlign(FD);
   return CGF.MakeAddrLValue(V, E->getType(), Alignment,
                             AlignmentSource::Decl);
@@ -6064,7 +6068,7 @@ LValue CodeGenFunction::EmitStmtExprLValue(const StmtExpr *E) {
                         AlignmentSource::Decl);
 }
 
-RValue CodeGenFunction::EmitCall(QualType CalleeType,
+RValue CodeGenFunction::EmitCall(QualType OriginalCalleeType,
                                  const CGCallee &OrigCallee, const CallExpr *E,
                                  ReturnValueSlot ReturnValue,
                                  llvm::Value *Chain,
@@ -6072,7 +6076,7 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
                                  CGFunctionInfo const **ResolvedFnInfo) {
   // Get the actual function type. The callee type will always be a pointer to
   // function type or a block pointer type.
-  assert(CalleeType->isFunctionPointerType() &&
+  assert(OriginalCalleeType->isFunctionPointerType() &&
          "Call must have function pointer type!");
 
   const Decl *TargetDecl =
@@ -6082,7 +6086,7 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
           !cast<FunctionDecl>(TargetDecl)->isImmediateFunction()) &&
          "trying to emit a call to an immediate function");
 
-  CalleeType = getContext().getCanonicalType(CalleeType);
+  QualType CalleeType = getContext().getCanonicalType(OriginalCalleeType);
 
   auto PointeeType = cast<PointerType>(CalleeType)->getPointeeType();
 
@@ -6168,10 +6172,16 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
       FD && FD->hasAttr<OpenCLKernelAttr>())
     CGM.getTargetCodeGenInfo().setOCLKernelStubCallingConvention(FnType);
 
+  // Use the original callee type because the canonical type will have
+  // attributes stripped.
+  bool CFIUnchecked =
+      OriginalCalleeType->isPointerToCFIUncheckedCalleeFunctionOrMemberFunction(
+          CGM.getContext());
+
   // If we are checking indirect calls and this call is indirect, check that the
   // function pointer is a member of the bit set for the function type.
   if (SanOpts.has(SanitizerKind::CFIICall) &&
-      (!TargetDecl || !isa<FunctionDecl>(TargetDecl))) {
+      (!TargetDecl || !isa<FunctionDecl>(TargetDecl)) && !CFIUnchecked) {
     SanitizerScope SanScope(this);
     EmitSanitizerStatReport(llvm::SanStat_CFI_ICall);
 

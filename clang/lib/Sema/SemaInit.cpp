@@ -7936,7 +7936,7 @@ ExprResult InitializationSequence::Perform(Sema &S,
       break;
     }
 
-    case SK_BindReference:
+    case SK_BindReference: {
       // Reference binding does not have any corresponding ASTs.
 
       // Check exception specifications
@@ -7957,7 +7957,21 @@ ExprResult InitializationSequence::Perform(Sema &S,
       }
 
       CheckForNullPointerDereference(S, CurInit.get());
+
+      QualType InitTy = CurInit.get()->getType();
+      const ASTContext &Ctx = S.Context;
+      bool DiscardingCFIUnchecked =
+          InitTy->isPointerToCFIUncheckedCalleeFunctionOrMemberFunction(Ctx) &&
+          !DestType->isPointerToCFIUncheckedCalleeFunctionOrMemberFunction(Ctx);
+      DiscardingCFIUnchecked |= InitTy->hasCFIUncheckedCallee(Ctx) &&
+                                !DestType->hasCFIUncheckedCallee(Ctx);
+      if (DiscardingCFIUnchecked) {
+        S.Diag(CurInit.get()->getExprLoc(),
+               diag::warn_cast_discards_cfi_unchecked_callee)
+            << CurInit.get()->getType() << DestType;
+      }
       break;
+    }
 
     case SK_BindReferenceToTemporary: {
       // Make sure the "temporary" is actually an rvalue.

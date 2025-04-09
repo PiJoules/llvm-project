@@ -916,6 +916,18 @@ static void handleDiagnoseIfAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
       cast<NamedDecl>(D)));
 }
 
+static void handleCFIUncheckedCalleeAttr(Sema &S, Decl *D,
+                                         const ParsedAttr &AL) {
+  // Just check for TagDecls (structs/classes) here. All other types are
+  // diagnosed elsewhere in Sema.
+  if (const auto *TD = dyn_cast<TagDecl>(D)) {
+    if (!D->getFunctionType() && !TD->isDependentType()) {
+      S.Diag(AL.getLoc(), diag::warn_cfi_unchecked_callee_on_non_function)
+          << QualType(TD->getTypeForDecl(), /*Quals=*/0);
+    }
+  }
+}
+
 static void handleNoBuiltinAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   static constexpr const StringRef kWildcard = "*";
 
@@ -7102,6 +7114,9 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
     break;
   case ParsedAttr::AT_NoBuiltin:
     handleNoBuiltinAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_CFIUncheckedCallee:
+    handleCFIUncheckedCalleeAttr(S, D, AL);
     break;
   case ParsedAttr::AT_ExtVectorType:
     handleExtVectorTypeAttr(S, D, AL);

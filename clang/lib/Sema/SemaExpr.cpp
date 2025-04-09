@@ -9837,6 +9837,17 @@ Sema::CheckSingleAssignmentConstraints(QualType LHSType, ExprResult &CallerRHS,
   Sema::AssignConvertType result =
     CheckAssignmentConstraints(LHSType, RHS, Kind, ConvertRHS);
 
+  if (const auto *IC = dyn_cast_or_null<ImplicitCastExpr>(RHS.get())) {
+    if (result != Incompatible && !IC->isPartOfExplicitCast() &&
+        IC->getType()->isPointerToCFIUncheckedCalleeFunctionOrMemberFunction(
+            Context) &&
+        !LHSType->isPointerToCFIUncheckedCalleeFunctionOrMemberFunction(
+            Context)) {
+      Diag(IC->getExprLoc(), diag::warn_cast_discards_cfi_unchecked_callee)
+          << IC->getType() << LHSType;
+    }
+  }
+
   // C99 6.5.16.1p2: The value of the right operand is converted to the
   // type of the assignment expression.
   // CheckAssignmentConstraints allows the left-hand side to be a reference,

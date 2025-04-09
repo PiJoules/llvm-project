@@ -2088,6 +2088,9 @@ void TypePrinter::printAttributedAfter(const AttributedType *T,
   case attr::NoDeref:
     OS << "noderef";
     break;
+  case attr::CFIUncheckedCallee:
+    OS << "cfi_unchecked_callee";
+    break;
   case attr::AcquireHandle:
     OS << "acquire_handle";
     break;

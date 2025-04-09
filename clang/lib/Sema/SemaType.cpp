@@ -8815,6 +8815,19 @@ static void processTypeAttrs(TypeProcessingState &state, QualType &type,
       break;
     }
 
+    case ParsedAttr::AT_CFIUncheckedCallee: {
+      if (!type->isFunctionType() && !type->isDependentType()) {
+        state.getSema().Diag(attr.getLoc(),
+                             diag::warn_cfi_unchecked_callee_on_non_function)
+            << type;
+      }
+      ASTContext &Ctx = state.getSema().Context;
+      type = state.getAttributedType(
+          createSimpleAttr<CFIUncheckedCalleeAttr>(Ctx, attr), type, type);
+      attr.setUsedAsTypeAttr();
+      break;
+    }
+
     case ParsedAttr::AT_MatrixType:
       HandleMatrixTypeAttr(type, attr, state.getSema());
       attr.setUsedAsTypeAttr();

@@ -2730,6 +2730,15 @@ public:
 
   bool isOverloadableType() const;
 
+  /// Return true if this type is marked with the `cfi_unchecked_callee`
+  /// attribute.
+  bool hasCFIUncheckedCallee(const ASTContext &) const;
+
+  /// Return true if this type is a pointer to a function or member function
+  /// marked with the `cfi_unchecked_callee` attribute.
+  bool isPointerToCFIUncheckedCalleeFunctionOrMemberFunction(
+      const ASTContext &) const;
+
   /// Determine wither this type is a C++ elaborated-type-specifier.
   bool isElaboratedTypeSpecifier() const;
 
@@ -8625,6 +8634,40 @@ inline bool Type::isOverloadableType() const {
     return isRecordType() || isEnumeralType();
   return !isArrayType() && !isFunctionType() && !isAnyPointerType() &&
          !isMemberPointerType();
+}
+
+inline bool Type::hasCFIUncheckedCallee(const ASTContext &Context) const {
+  // Carefully strip sugar coating the underlying attributed type. We don't
+  // want to remove all the sugar because this will remove any wrapping
+  // attributed types.
+  QualType Ty(this, /*Quals=*/0);
+
+  while (1) {
+    if (Ty->hasAttr(attr::CFIUncheckedCallee))
+      return true;
+
+    QualType Desugared = Ty.getSingleStepDesugaredType(Context);
+
+    // This means the type has no more sugar.
+    if (Ty == Desugared)
+      break;
+
+    Ty = Desugared;
+  }
+
+  return false;
+}
+
+inline bool Type::isPointerToCFIUncheckedCalleeFunctionOrMemberFunction(
+    const ASTContext &Context) const {
+  if (const auto *MFT = dyn_cast<MemberPointerType>(this)) {
+    if (MFT->isMemberFunctionPointer())
+      return MFT->getPointeeType()->hasCFIUncheckedCallee(Context);
+  } else if (const auto *PtrTy = dyn_cast<PointerType>(this)) {
+    return PtrTy->getPointeeType()->hasCFIUncheckedCallee(Context);
+  }
+
+  return false;
 }
 
 /// Determines whether this type is written as a typedef-name.

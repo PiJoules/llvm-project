@@ -4619,6 +4619,16 @@ Sema::PerformImplicitConversion(Expr *From, QualType ToType,
     return ExprError();
   }
 
+  if (CCK == CheckedConversionKind::Implicit) {
+    if (From->getType()->isPointerToCFIUncheckedCalleeFunctionOrMemberFunction(
+            Context) &&
+        !ToType->isPointerToCFIUncheckedCalleeFunctionOrMemberFunction(
+            Context)) {
+      Diag(From->getExprLoc(), diag::warn_cast_discards_cfi_unchecked_callee)
+          << From->getType() << ToType;
+    }
+  }
+
   // Everything went well.
   return From;
 }
@@ -7920,10 +7930,25 @@ QualType Sema::FindCompositePointerType(SourceLocation Loc,
             EPI1.ExceptionSpec, EPI2.ExceptionSpec, ExceptionTypeStorage,
             getLangOpts().CPlusPlus17);
 
+        // `cfi_unchecked_callee` needs to be preserved to prevent diagnosing on
+        // implicit casts when finding common types for binary operations. If
+        // one of the operands has the attribute, let's make the common type
+        // have it also.
+        bool HasCFIUncheckedCallee =
+            Composite1->hasCFIUncheckedCallee(Context) ||
+            Composite2->hasCFIUncheckedCallee(Context);
+
         Composite1 = Context.getFunctionType(FPT1->getReturnType(),
                                              FPT1->getParamTypes(), EPI1);
         Composite2 = Context.getFunctionType(FPT2->getReturnType(),
                                              FPT2->getParamTypes(), EPI2);
+
+        if (HasCFIUncheckedCallee) {
+          Composite1 = Context.getAttributedType(attr::CFIUncheckedCallee,
+                                                 Composite1, Composite1);
+          Composite2 = Context.getAttributedType(attr::CFIUncheckedCallee,
+                                                 Composite2, Composite2);
+        }
       }
     }
   }
