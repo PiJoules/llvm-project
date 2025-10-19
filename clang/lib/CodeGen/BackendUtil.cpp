@@ -68,6 +68,7 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
 #include "llvm/Transforms/Instrumentation/AllocToken.h"
 #include "llvm/Transforms/Instrumentation/BoundsChecking.h"
+#include "llvm/Transforms/Instrumentation/CopySanitizer.h"
 #include "llvm/Transforms/Instrumentation/DataFlowSanitizer.h"
 #include "llvm/Transforms/Instrumentation/GCOVProfiler.h"
 #include "llvm/Transforms/Instrumentation/HWAddressSanitizer.h"
@@ -795,6 +796,10 @@ static void addSanitizers(const Triple &TargetTriple,
     };
     HWASanPass(SanitizerKind::HWAddress, false);
     HWASanPass(SanitizerKind::KernelHWAddress, true);
+
+    if (LangOpts.Sanitize.has(SanitizerKind::Copy)) {
+      MPM.addPass(CopySanitizerPass());
+    }
 
     if (LangOpts.Sanitize.has(SanitizerKind::DataFlow)) {
       MPM.addPass(DataFlowSanitizerPass(LangOpts.NoSanitizeFiles,

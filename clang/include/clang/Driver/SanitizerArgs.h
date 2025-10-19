@@ -88,6 +88,7 @@ public:
 
   bool needsMemProfRt() const { return NeedsMemProfRt; }
   bool needsAsanRt() const { return Sanitizers.has(SanitizerKind::Address); }
+  bool needsCopysanRt() const { return Sanitizers.has(SanitizerKind::Copy); }
   bool needsHwasanRt() const {
     return Sanitizers.has(SanitizerKind::HWAddress);
   }

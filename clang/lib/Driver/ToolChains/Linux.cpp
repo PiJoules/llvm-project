@@ -813,6 +813,7 @@ SanitizerMask Linux::getSupportedSanitizers() const {
   Res |= SanitizerKind::PointerCompare;
   Res |= SanitizerKind::PointerSubtract;
   Res |= SanitizerKind::Realtime;
+  Res |= SanitizerKind::Copy;
   Res |= SanitizerKind::Fuzzer;
   Res |= SanitizerKind::FuzzerNoLink;
   Res |= SanitizerKind::KernelAddress;
