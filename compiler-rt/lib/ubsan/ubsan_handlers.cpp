@@ -204,6 +204,39 @@ void __ubsan::__ubsan_handle_alignment_assumption_abort(
   Die();
 }
 
+static void handleNonnullAssumptionImpl(NonnullAssumptionData *Data,
+                                        ValueHandle Pointer,
+                                        ReportOptions Opts) {
+  Location Loc = Data->Loc.acquire();
+  SourceLocation AssumptionLoc = Data->AssumptionLoc.acquire();
+
+  ErrorType ET = ErrorType::NonnullAssumption;
+
+  if (ignoreReport(Loc.getSourceLocation(), Opts, ET))
+    return;
+
+  ScopedReport R(Opts, Loc, ET);
+
+  Diag(Loc, DL_Error, ET, "assumption of non-null value for pointer of type %0 "
+                          "failed")
+      << Data->Type;
+
+  if (!AssumptionLoc.isInvalid())
+    Diag(AssumptionLoc, DL_Note, ET, "assumption was specified here");
+}
+
+void __ubsan::__ubsan_handle_nonnull_assumption(NonnullAssumptionData *Data,
+                                                ValueHandle Pointer) {
+  GET_REPORT_OPTIONS(false);
+  handleNonnullAssumptionImpl(Data, Pointer, Opts);
+}
+void __ubsan::__ubsan_handle_nonnull_assumption_abort(
+    NonnullAssumptionData *Data, ValueHandle Pointer) {
+  GET_REPORT_OPTIONS(true);
+  handleNonnullAssumptionImpl(Data, Pointer, Opts);
+  Die();
+}
+
 /// \brief Common diagnostic emission for various forms of integer overflow.
 template <typename T>
 static void handleIntegerOverflowImpl(OverflowData *Data, ValueHandle LHS,

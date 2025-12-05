@@ -49,6 +49,17 @@ struct AlignmentAssumptionData {
 RECOVERABLE(alignment_assumption, AlignmentAssumptionData *Data,
             ValueHandle Pointer, ValueHandle Alignment, ValueHandle Offset)
 
+struct NonnullAssumptionData {
+  SourceLocation Loc;
+  SourceLocation AssumptionLoc;
+  const TypeDescriptor &Type;
+};
+
+/// \brief Handle a runtime nonnull assumption check failure,
+/// caused by a null pointer.
+RECOVERABLE(nonnull_assumption, NonnullAssumptionData *Data,
+            ValueHandle Pointer)
+
 struct OverflowData {
   SourceLocation Loc;
   const TypeDescriptor &Type;

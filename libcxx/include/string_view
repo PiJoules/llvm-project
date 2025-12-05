@@ -332,6 +332,11 @@ public:
     _LIBCPP_ASSERT_NON_NULL(
         __len == 0 || __s != nullptr, "string_view::string_view(_CharT *, size_t): received nullptr");
 #  endif
+    if (__len > 0) {
+#  if __has_builtin(__builtin_assume_dereferenceable)
+      __builtin_assume_dereferenceable(__s, __len);
+#  endif
+    }
   }
 
 #  if _LIBCPP_STD_VER >= 20
