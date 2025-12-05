@@ -3516,6 +3516,23 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
       SizeValue =
           Builder.CreateIntCast(SizeValue, IntPtrTy, false, "casted.size");
     Builder.CreateDereferenceableAssumption(PtrValue, SizeValue);
+
+    if (SanOpts.has(SanitizerKind::Builtin)) {
+      auto CheckOrdinal = SanitizerKind::SO_Builtin;
+      auto CheckHandler = SanitizerHandler::NonnullAssumption;
+      SanitizerDebugLocation SanScope(this, {CheckOrdinal}, CheckHandler);
+
+      Value *SizeZero = Builder.CreateIsNull(SizeValue);
+      Value *PtrNonNull = Builder.CreateIsNotNull(PtrValue);
+      Value *Cond = Builder.CreateOr(SizeZero, PtrNonNull);
+
+      EmitCheck(std::make_pair(Cond, CheckOrdinal), CheckHandler,
+                {EmitCheckSourceLocation(E->getExprLoc()),
+                 EmitCheckSourceLocation(E->getExprLoc()),
+                 EmitCheckTypeDescriptor(Ptr->getType())},
+                {PtrValue});
+    }
+
     return RValue::get(nullptr);
   }
   case Builtin::BI__assume:
