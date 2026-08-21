@@ -1476,8 +1476,7 @@ define void @test_store_unaligned(ptr %a, i64 %b) sanitize_hwaddress {
 ; CHECK-SAME: (ptr [[A:%.*]], i64 [[B:%.*]]) #[[ATTR0]] {
 ; CHECK-NEXT:  entry:
 ; CHECK-NEXT:    [[DOTHWASAN_SHADOW:%.*]] = call ptr asm "", "=r,0"(ptr @__hwasan_shadow)
-; CHECK-NEXT:    [[TMP0:%.*]] = ptrtoint ptr [[A]] to i64
-; CHECK-NEXT:    call void @__hwasan_storeN(i64 [[TMP0]], i64 8)
+; CHECK-NEXT:    call void @llvm.hwasan.check.memaccess.unaligned.shortgranules(ptr [[DOTHWASAN_SHADOW]], ptr [[A]], i32 19)
 ; CHECK-NEXT:    store i64 [[B]], ptr [[A]], align 4
 ; CHECK-NEXT:    ret void
 ;
@@ -1485,8 +1484,7 @@ define void @test_store_unaligned(ptr %a, i64 %b) sanitize_hwaddress {
 ; NOFASTPATH-SAME: (ptr [[A:%.*]], i64 [[B:%.*]]) #[[ATTR0]] {
 ; NOFASTPATH-NEXT:  entry:
 ; NOFASTPATH-NEXT:    [[DOTHWASAN_SHADOW:%.*]] = call ptr asm "", "=r,0"(ptr @__hwasan_shadow)
-; NOFASTPATH-NEXT:    [[TMP0:%.*]] = ptrtoint ptr [[A]] to i64
-; NOFASTPATH-NEXT:    call void @__hwasan_storeN(i64 [[TMP0]], i64 8)
+; NOFASTPATH-NEXT:    call void @llvm.hwasan.check.memaccess.unaligned.shortgranules(ptr [[DOTHWASAN_SHADOW]], ptr [[A]], i32 19)
 ; NOFASTPATH-NEXT:    store i64 [[B]], ptr [[A]], align 4
 ; NOFASTPATH-NEXT:    ret void
 ;
@@ -1495,7 +1493,18 @@ define void @test_store_unaligned(ptr %a, i64 %b) sanitize_hwaddress {
 ; FASTPATH-NEXT:  entry:
 ; FASTPATH-NEXT:    [[DOTHWASAN_SHADOW:%.*]] = call ptr asm "", "=r,0"(ptr @__hwasan_shadow)
 ; FASTPATH-NEXT:    [[TMP0:%.*]] = ptrtoint ptr [[A]] to i64
-; FASTPATH-NEXT:    call void @__hwasan_storeN(i64 [[TMP0]], i64 8)
+; FASTPATH-NEXT:    [[TMP1:%.*]] = lshr i64 [[TMP0]], 56
+; FASTPATH-NEXT:    [[TMP2:%.*]] = trunc i64 [[TMP1]] to i8
+; FASTPATH-NEXT:    [[TMP3:%.*]] = and i64 [[TMP0]], 72057594037927935
+; FASTPATH-NEXT:    [[TMP4:%.*]] = lshr i64 [[TMP3]], 4
+; FASTPATH-NEXT:    [[TMP5:%.*]] = getelementptr i8, ptr [[DOTHWASAN_SHADOW]], i64 [[TMP4]]
+; FASTPATH-NEXT:    [[TMP6:%.*]] = load i8, ptr [[TMP5]], align 1
+; FASTPATH-NEXT:    [[TMP7:%.*]] = icmp ne i8 [[TMP2]], [[TMP6]]
+; FASTPATH-NEXT:    br i1 [[TMP7]], label [[TMP8:%.*]], label [[TMP9:%.*]], !prof [[PROF2]]
+; FASTPATH:       8:
+; FASTPATH-NEXT:    call void @llvm.hwasan.check.memaccess.unaligned.shortgranules(ptr [[DOTHWASAN_SHADOW]], ptr [[A]], i32 19)
+; FASTPATH-NEXT:    br label [[TMP9]]
+; FASTPATH:       9:
 ; FASTPATH-NEXT:    store i64 [[B]], ptr [[A]], align 4
 ; FASTPATH-NEXT:    ret void
 ;
@@ -1503,8 +1512,7 @@ define void @test_store_unaligned(ptr %a, i64 %b) sanitize_hwaddress {
 ; ABORT-DYNAMIC-SHADOW-SAME: (ptr [[A:%.*]], i64 [[B:%.*]]) #[[ATTR0]] {
 ; ABORT-DYNAMIC-SHADOW-NEXT:  entry:
 ; ABORT-DYNAMIC-SHADOW-NEXT:    [[DOTHWASAN_SHADOW:%.*]] = call ptr asm "", "=r,0"(ptr @__hwasan_shadow)
-; ABORT-DYNAMIC-SHADOW-NEXT:    [[TMP0:%.*]] = ptrtoint ptr [[A]] to i64
-; ABORT-DYNAMIC-SHADOW-NEXT:    call void @__hwasan_storeN(i64 [[TMP0]], i64 8)
+; ABORT-DYNAMIC-SHADOW-NEXT:    call void @llvm.hwasan.check.memaccess.unaligned.shortgranules(ptr [[DOTHWASAN_SHADOW]], ptr [[A]], i32 19)
 ; ABORT-DYNAMIC-SHADOW-NEXT:    store i64 [[B]], ptr [[A]], align 4
 ; ABORT-DYNAMIC-SHADOW-NEXT:    ret void
 ;
@@ -1521,8 +1529,7 @@ define void @test_store_unaligned(ptr %a, i64 %b) sanitize_hwaddress {
 ; ABORT-ZERO-BASED-SHADOW-SAME: (ptr [[A:%.*]], i64 [[B:%.*]]) #[[ATTR0]] {
 ; ABORT-ZERO-BASED-SHADOW-NEXT:  entry:
 ; ABORT-ZERO-BASED-SHADOW-NEXT:    [[DOTHWASAN_SHADOW:%.*]] = call ptr asm "", "=r,0"(ptr null)
-; ABORT-ZERO-BASED-SHADOW-NEXT:    [[TMP0:%.*]] = ptrtoint ptr [[A]] to i64
-; ABORT-ZERO-BASED-SHADOW-NEXT:    call void @__hwasan_storeN(i64 [[TMP0]], i64 8)
+; ABORT-ZERO-BASED-SHADOW-NEXT:    call void @llvm.hwasan.check.memaccess.unaligned.shortgranules.fixedshadow(ptr [[A]], i32 19, i64 0)
 ; ABORT-ZERO-BASED-SHADOW-NEXT:    store i64 [[B]], ptr [[A]], align 4
 ; ABORT-ZERO-BASED-SHADOW-NEXT:    ret void
 ;

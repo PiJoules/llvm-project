@@ -21,10 +21,15 @@
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Analysis/GlobalsModRef.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/StackSafetyAnalysis.h"
+
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/BinaryFormat/Dwarf.h"
@@ -292,6 +297,52 @@ static cl::opt<uint64_t>
 STATISTIC(NumTotalFuncs, "Number of total funcs");
 STATISTIC(NumInstrumentedFuncs, "Number of instrumented funcs");
 STATISTIC(NumNoProfileSummaryFuncs, "Number of funcs without PS");
+STATISTIC(NumOptimizedAccessesToGlobalVar,
+          "Number of optimized accesses to global vars");
+STATISTIC(NumOptimizedAccessesToSameTemp,
+          "Number of optimized accesses to same temp");
+STATISTIC(NumOptimizedAccessesByCoalescing,
+          "Number of optimized accesses by coalescing");
+STATISTIC(NumHoistedLoopChecks,
+          "Number of loop-invariant memory checks hoisted");
+STATISTIC(NumOptimizedAccessesInLoops,
+          "Number of memory accesses optimized in loops");
+STATISTIC(NumSingleTagAllocas,
+          "Number of allocas using shared stack frame tag");
+
+// Optimization flags. Not user visible, used mostly for testing
+// and benchmarking the tool.
+
+static cl::opt<bool> ClOpt("hwasan-opt", cl::desc("Optimize instrumentation"),
+                           cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClOptSameTemp(
+    "hwasan-opt-same-temp", cl::desc("Instrument the same temp just once"),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClOptGlobals("hwasan-opt-globals",
+                                  cl::desc("Don't instrument scalar globals"),
+                                  cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClOptCoalesce(
+    "hwasan-opt-coalesce", cl::desc("Coalesce adjacent memory access checks"),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClOptLoops(
+    "hwasan-opt-loops", cl::desc("Hoist loop-invariant memory access checks"),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClSingleTagPerFrame(
+    "hwasan-single-tag-per-frame",
+    cl::desc("Use a single tag for all stack allocas in a frame"), cl::Hidden,
+    cl::init(false));
+
+static cl::opt<bool> ClOptUnaligned(
+    "hwasan-opt-unaligned",
+    cl::desc("Emit register-preserving outlined checks for unaligned accesses on AArch64"),
+    cl::Hidden, cl::init(true));
+
+
 
 namespace {
 
@@ -330,12 +381,22 @@ bool shouldDetectUseAfterScope(const Triple &TargetTriple) {
 class HWAddressSanitizer {
 public:
   HWAddressSanitizer(Module &M, bool CompileKernel, bool Recover,
-                     const StackSafetyGlobalInfo *SSI)
+                     const StackSafetyGlobalInfo *SSI,
+                     bool DisableOptimization = false)
       : M(M), SSI(SSI) {
     this->Recover = optOr(ClRecover, Recover);
     this->CompileKernel = optOr(ClEnableKhwasan, CompileKernel);
+    this->Opt = optOr(ClOpt, !DisableOptimization);
+    this->OptSameTemp = optOr(ClOptSameTemp, true);
+    this->OptGlobals = optOr(ClOptGlobals, true);
+    this->OptCoalesce = optOr(ClOptCoalesce, true);
+    this->OptLoops = optOr(ClOptLoops, true);
+    this->SingleTagPerFrame = optOr(ClSingleTagPerFrame, false);
+    this->OptUnaligned = optOr(ClOptUnaligned, true);
     this->Rng = ClRandomKeepRate.getNumOccurrences() ? M.createRNG(DEBUG_TYPE)
                                                      : nullptr;
+
+
 
     initializeModule();
   }
@@ -373,18 +434,23 @@ private:
   void instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
                                   unsigned AccessSizeIndex,
                                   Instruction *InsertBefore,
-                                  DomTreeUpdater &DTU, LoopInfo *LI);
+                                  DomTreeUpdater &DTU, LoopInfo *LI,
+                                  bool IsUnaligned = false);
   void instrumentMemAccessInline(Value *Ptr, bool IsWrite,
                                  unsigned AccessSizeIndex,
                                  Instruction *InsertBefore, DomTreeUpdater &DTU,
                                  LoopInfo *LI);
-  bool ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE, MemIntrinsic *MI);
+  bool ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE, MemIntrinsic *MI,
+                          const TargetLibraryInfo &TLI);
   void instrumentMemIntrinsic(MemIntrinsic *MI);
   bool instrumentMemAccess(InterestingMemoryOperand &O, DomTreeUpdater &DTU,
                            LoopInfo *LI, const DataLayout &DL);
-  bool ignoreAccessWithoutRemark(Instruction *Inst, Value *Ptr);
+  bool ignoreAccessWithoutRemark(Instruction *Inst, Value *Ptr,
+                                 const TargetLibraryInfo &TLI,
+                                 TypeSize AccessSize);
   bool ignoreAccess(OptimizationRemarkEmitter &ORE, Instruction *Inst,
-                    Value *Ptr);
+                    Value *Ptr, const TargetLibraryInfo &TLI,
+                    TypeSize AccessSize);
 
   void getInterestingMemoryOperands(
       OptimizationRemarkEmitter &ORE, Instruction *I,
@@ -483,7 +549,16 @@ private:
   bool InstrumentWithCalls;
   bool InstrumentStack;
   bool InstrumentGlobals;
+  bool Opt;
+  bool OptSameTemp;
+  bool OptGlobals;
+  bool OptCoalesce;
+  bool OptLoops;
+  bool SingleTagPerFrame;
+  bool OptUnaligned;
   bool DetectUseAfterScope;
+
+
   bool UsePageAliases;
   bool UseMatchAllCallback;
 
@@ -524,7 +599,8 @@ PreservedAnalyses HWAddressSanitizerPass::run(Module &M,
   if (shouldUseStackSafetyAnalysis(TargetTriple, Options.DisableOptimization))
     SSI = &MAM.getResult<StackSafetyGlobalAnalysis>(M);
 
-  HWAddressSanitizer HWASan(M, Options.CompileKernel, Options.Recover, SSI);
+  HWAddressSanitizer HWASan(M, Options.CompileKernel, Options.Recover, SSI,
+                            Options.DisableOptimization);
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   for (Function &F : M)
     HWASan.sanitizeFunction(F, FAM);
@@ -854,8 +930,70 @@ Value *HWAddressSanitizer::getShadowNonTls(IRBuilder<> &IRB) {
   return IRB.CreateLoad(PtrTy, GlobalDynamicAddress);
 }
 
+static const Value *getBaseAndConstantOffset(const Value *Ptr,
+                                             const DataLayout &DL,
+                                             int64_t &ByteOffset) {
+  APInt Offset(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+  const Value *Base =
+      Ptr->stripAndAccumulateConstantOffsets(DL, Offset, /*AllowNonInbounds=*/true);
+  ByteOffset = Offset.getSExtValue();
+  return Base;
+}
+
+static const Value *getUnderlyingGlobalAndOffset(const Value *Ptr,
+                                                 const DataLayout &DL,
+                                                 int64_t &ByteOffset) {
+
+  APInt Offset(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+  const Value *V = Ptr;
+  while (true) {
+    if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+      APInt GEPOffset(DL.getIndexTypeSizeInBits(V->getType()), 0);
+      if (!GEP->accumulateConstantOffset(DL, GEPOffset))
+        return nullptr;
+      Offset += GEPOffset;
+      V = GEP->getPointerOperand();
+    } else if (Operator::getOpcode(V) == Instruction::BitCast ||
+               Operator::getOpcode(V) == Instruction::AddrSpaceCast) {
+      V = cast<Operator>(V)->getOperand(0);
+    } else {
+      break;
+    }
+  }
+  ByteOffset = Offset.getSExtValue();
+  return V;
+}
+
+// isSafeGlobalAccess returns true if Ptr is always inbounds with respect to its
+// base GlobalVariable or GlobalAlias object.
+static bool isSafeGlobalAccess(const Value *Base, int64_t ByteOffset,
+                               TypeSize AccessSizeInBits, const DataLayout &DL,
+                               const TargetLibraryInfo &TLI) {
+  if (AccessSizeInBits.isScalable() || AccessSizeInBits == 0)
+    return false;
+  uint64_t NeededSizeBytes = AccessSizeInBits / 8;
+
+  uint64_t ObjectSize = 0;
+  if (auto *GV = dyn_cast<GlobalVariable>(Base)) {
+    if (GV->isDeclaration() || GV->isThreadLocal())
+      return false;
+    ObjectSize = DL.getTypeAllocSize(GV->getValueType());
+  } else if (auto *GA = dyn_cast<GlobalAlias>(Base)) {
+    if (GA->isDeclaration() || GA->isThreadLocal())
+      return false;
+    ObjectSize = DL.getTypeAllocSize(GA->getValueType());
+  } else {
+    return false;
+  }
+
+  return ByteOffset >= 0 && (uint64_t)ByteOffset <= ObjectSize &&
+         ObjectSize - (uint64_t)ByteOffset >= NeededSizeBytes;
+}
+
 bool HWAddressSanitizer::ignoreAccessWithoutRemark(Instruction *Inst,
-                                                   Value *Ptr) {
+                                                   Value *Ptr,
+                                                   const TargetLibraryInfo &TLI,
+                                                   TypeSize AccessSize) {
   // Do not instrument accesses from different address spaces; we cannot deal
   // with them.
   Type *PtrTy = cast<PointerType>(Ptr->getType()->getScalarType());
@@ -876,18 +1014,28 @@ bool HWAddressSanitizer::ignoreAccessWithoutRemark(Instruction *Inst,
       return true;
   }
 
-  if (isa<GlobalVariable>(getUnderlyingObject(Ptr))) {
+  int64_t ByteOffset = 0;
+  const DataLayout &DL = Inst->getDataLayout();
+  const Value *Base = getUnderlyingGlobalAndOffset(Ptr, DL, ByteOffset);
+  if (Base && (isa<GlobalVariable>(Base) || isa<GlobalAlias>(Base))) {
     if (!InstrumentGlobals)
       return true;
-    // TODO: Optimize inbound global accesses, like Asan `instrumentMop`.
+    if (Opt && OptGlobals) {
+      if (isSafeGlobalAccess(Base, ByteOffset, AccessSize, DL, TLI)) {
+        ++NumOptimizedAccessesToGlobalVar;
+        return true;
+      }
+    }
   }
 
   return false;
 }
 
 bool HWAddressSanitizer::ignoreAccess(OptimizationRemarkEmitter &ORE,
-                                      Instruction *Inst, Value *Ptr) {
-  bool Ignored = ignoreAccessWithoutRemark(Inst, Ptr);
+                                      Instruction *Inst, Value *Ptr,
+                                      const TargetLibraryInfo &TLI,
+                                      TypeSize AccessSize) {
+  bool Ignored = ignoreAccessWithoutRemark(Inst, Ptr, TLI, AccessSize);
   if (Ignored) {
     ORE.emit(
         [&]() { return OptimizationRemark(DEBUG_TYPE, "ignoreAccess", Inst); });
@@ -911,33 +1059,47 @@ void HWAddressSanitizer::getInterestingMemoryOperands(
   if (ShadowBase == I)
     return;
 
+  const DataLayout &DL = I->getDataLayout();
   if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
-    if (!ClInstrumentReads || ignoreAccess(ORE, I, LI->getPointerOperand()))
+    if (!ClInstrumentReads ||
+        ignoreAccess(ORE, I, LI->getPointerOperand(), TLI,
+                     DL.getTypeStoreSizeInBits(LI->getType())))
       return;
     Interesting.emplace_back(I, LI->getPointerOperandIndex(), false,
                              LI->getType(), LI->getAlign());
   } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
-    if (!ClInstrumentWrites || ignoreAccess(ORE, I, SI->getPointerOperand()))
+    if (!ClInstrumentWrites ||
+        ignoreAccess(ORE, I, SI->getPointerOperand(), TLI,
+                     DL.getTypeStoreSizeInBits(
+                         SI->getValueOperand()->getType())))
       return;
     Interesting.emplace_back(I, SI->getPointerOperandIndex(), true,
                              SI->getValueOperand()->getType(), SI->getAlign());
   } else if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(I)) {
-    if (!ClInstrumentAtomics || ignoreAccess(ORE, I, RMW->getPointerOperand()))
+    if (!ClInstrumentAtomics ||
+        ignoreAccess(ORE, I, RMW->getPointerOperand(), TLI,
+                     DL.getTypeStoreSizeInBits(
+                         RMW->getValOperand()->getType())))
       return;
     Interesting.emplace_back(I, RMW->getPointerOperandIndex(), true,
                              RMW->getValOperand()->getType(), std::nullopt);
   } else if (AtomicCmpXchgInst *XCHG = dyn_cast<AtomicCmpXchgInst>(I)) {
-    if (!ClInstrumentAtomics || ignoreAccess(ORE, I, XCHG->getPointerOperand()))
+    if (!ClInstrumentAtomics ||
+        ignoreAccess(ORE, I, XCHG->getPointerOperand(), TLI,
+                     DL.getTypeStoreSizeInBits(
+                         XCHG->getCompareOperand()->getType())))
       return;
     Interesting.emplace_back(I, XCHG->getPointerOperandIndex(), true,
                              XCHG->getCompareOperand()->getType(),
                              std::nullopt);
   } else if (auto *CI = dyn_cast<CallInst>(I)) {
     for (unsigned ArgNo = 0; ArgNo < CI->arg_size(); ArgNo++) {
-      if (!ClInstrumentByval || !CI->isByValArgument(ArgNo) ||
-          ignoreAccess(ORE, I, CI->getArgOperand(ArgNo)))
+      if (!ClInstrumentByval || !CI->isByValArgument(ArgNo))
         continue;
       Type *Ty = CI->getParamByValType(ArgNo);
+      if (ignoreAccess(ORE, I, CI->getArgOperand(ArgNo), TLI,
+                       DL.getTypeStoreSizeInBits(Ty)))
+        continue;
       Interesting.emplace_back(I, ArgNo, false, Ty, Align(1));
     }
     maybeMarkSanitizerLibraryCallNoBuiltin(CI, &TLI);
@@ -1026,7 +1188,8 @@ void HWAddressSanitizer::instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
                                                     unsigned AccessSizeIndex,
                                                     Instruction *InsertBefore,
                                                     DomTreeUpdater &DTU,
-                                                    LoopInfo *LI) {
+                                                    LoopInfo *LI,
+                                                    bool IsUnaligned) {
   assert(!UsePageAliases);
   const int64_t AccessInfo = getAccessInfo(IsWrite, AccessSizeIndex);
 
@@ -1050,17 +1213,36 @@ void HWAddressSanitizer::instrumentMemAccessOutline(Value *Ptr, bool IsWrite,
   }
 
   if (UseFixedShadowIntrinsic) {
+    Intrinsic::ID Intrin;
+    if (IsUnaligned) {
+      Intrin =
+          UseShortGranules
+              ? Intrinsic::
+                    hwasan_check_memaccess_unaligned_shortgranules_fixedshadow
+              : Intrinsic::hwasan_check_memaccess_unaligned_fixedshadow;
+    } else {
+      Intrin = UseShortGranules
+                   ? Intrinsic::hwasan_check_memaccess_shortgranules_fixedshadow
+                   : Intrinsic::hwasan_check_memaccess_fixedshadow;
+    }
     IRB.CreateIntrinsic(
-        UseShortGranules
-            ? Intrinsic::hwasan_check_memaccess_shortgranules_fixedshadow
-            : Intrinsic::hwasan_check_memaccess_fixedshadow,
+        Intrin,
         {Ptr, ConstantInt::get(Int32Ty, AccessInfo),
          ConstantInt::get(Int64Ty, Mapping.offset())});
   } else {
+    Intrinsic::ID Intrin;
+    if (IsUnaligned) {
+      Intrin = UseShortGranules
+                   ? Intrinsic::
+                         hwasan_check_memaccess_unaligned_shortgranules
+                   : Intrinsic::hwasan_check_memaccess_unaligned;
+    } else {
+      Intrin = UseShortGranules
+                   ? Intrinsic::hwasan_check_memaccess_shortgranules
+                   : Intrinsic::hwasan_check_memaccess;
+    }
     IRB.CreateIntrinsic(
-        UseShortGranules ? Intrinsic::hwasan_check_memaccess_shortgranules
-                         : Intrinsic::hwasan_check_memaccess,
-        {ShadowBase, Ptr, ConstantInt::get(Int32Ty, AccessInfo)});
+        Intrin, {ShadowBase, Ptr, ConstantInt::get(Int32Ty, AccessInfo)});
   }
 }
 
@@ -1140,13 +1322,21 @@ void HWAddressSanitizer::instrumentMemAccessInline(Value *Ptr, bool IsWrite,
 }
 
 bool HWAddressSanitizer::ignoreMemIntrinsic(OptimizationRemarkEmitter &ORE,
-                                            MemIntrinsic *MI) {
+                                            MemIntrinsic *MI,
+                                            const TargetLibraryInfo &TLI) {
+  TypeSize AccessSize = TypeSize::getFixed(0);
+  if (ConstantInt *Len = dyn_cast<ConstantInt>(MI->getLength()))
+    AccessSize = TypeSize::getFixed(Len->getZExtValue() * 8);
+
   if (MemTransferInst *MTI = dyn_cast<MemTransferInst>(MI)) {
-    return (!ClInstrumentWrites || ignoreAccess(ORE, MTI, MTI->getDest())) &&
-           (!ClInstrumentReads || ignoreAccess(ORE, MTI, MTI->getSource()));
+    return (!ClInstrumentWrites ||
+            ignoreAccess(ORE, MTI, MTI->getDest(), TLI, AccessSize)) &&
+           (!ClInstrumentReads ||
+            ignoreAccess(ORE, MTI, MTI->getSource(), TLI, AccessSize));
   }
   if (isa<MemSetInst>(MI))
-    return !ClInstrumentWrites || ignoreAccess(ORE, MI, MI->getDest());
+    return !ClInstrumentWrites ||
+           ignoreAccess(ORE, MI, MI->getDest(), TLI, AccessSize);
   return false;
 }
 
@@ -1195,22 +1385,38 @@ bool HWAddressSanitizer::instrumentMemAccess(InterestingMemoryOperand &O,
 
   IRBuilder<> IRB(O.getInsn());
   if (!O.TypeStoreSize.isScalable() && isPowerOf2_64(O.TypeStoreSize) &&
-      (O.TypeStoreSize / 8 <= (1ULL << (kNumberOfAccessSizes - 1))) &&
-      (!O.Alignment || *O.Alignment >= Mapping.getObjectAlignment() ||
-       *O.Alignment >= O.TypeStoreSize / 8)) {
+      (O.TypeStoreSize / 8 <= (1ULL << (kNumberOfAccessSizes - 1)))) {
     size_t AccessSizeIndex = TypeSizeToSizeIndex(O.TypeStoreSize);
-    if (InstrumentWithCalls) {
-      SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
-      if (UseMatchAllCallback)
-        Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
-      IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
-                     Args);
-    } else if (OutlinedChecks) {
-      instrumentMemAccessOutline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
-                                 DTU, LI);
+    bool IsAligned = !O.Alignment ||
+                     *O.Alignment >= Mapping.getObjectAlignment() ||
+                     *O.Alignment >= O.TypeStoreSize / 8;
+    if (IsAligned) {
+      if (InstrumentWithCalls) {
+        SmallVector<Value *, 2> Args{IRB.CreatePointerCast(Addr, IntptrTy)};
+        if (UseMatchAllCallback)
+          Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
+        IRB.CreateCall(HwasanMemoryAccessCallback[O.IsWrite][AccessSizeIndex],
+                       Args);
+      } else if (OutlinedChecks) {
+        instrumentMemAccessOutline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
+                                   DTU, LI, /*IsUnaligned=*/false);
+      } else {
+        instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
+                                  DTU, LI);
+      }
     } else {
-      instrumentMemAccessInline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
-                                DTU, LI);
+      if (OutlinedChecks && TargetTriple.isAArch64() && OptUnaligned) {
+        instrumentMemAccessOutline(Addr, O.IsWrite, AccessSizeIndex, O.getInsn(),
+                                   DTU, LI, /*IsUnaligned=*/true);
+      } else {
+        SmallVector<Value *, 3> Args{
+            IRB.CreatePointerCast(Addr, IntptrTy),
+            IRB.CreateUDiv(IRB.CreateTypeSize(IntptrTy, O.TypeStoreSize),
+                           ConstantInt::get(IntptrTy, 8))};
+        if (UseMatchAllCallback)
+          Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
+        IRB.CreateCall(HwasanMemoryAccessCallbackSized[O.IsWrite], Args);
+      }
     }
   } else {
     SmallVector<Value *, 3> Args{
@@ -1261,6 +1467,8 @@ void HWAddressSanitizer::tagAlloca(IRBuilder<> &IRB, AllocaInst *AI, Value *Tag,
 }
 
 unsigned HWAddressSanitizer::retagMask(unsigned AllocaNo) {
+  if (SingleTagPerFrame)
+    return 0;
   if (TargetTriple.getArch() == Triple::x86_64)
     return AllocaNo & TagMaskByte;
 
@@ -1312,9 +1520,14 @@ Value *HWAddressSanitizer::getAllocaTag(IRBuilder<> &IRB, Value *StackTag,
                                         unsigned AllocaNo) {
   if (ClGenerateTagsWithCalls)
     return getNextTagWithCall(IRB);
+  if (SingleTagPerFrame) {
+    ++NumSingleTagAllocas;
+    return StackTag;
+  }
   return IRB.CreateXor(
       StackTag, ConstantInt::get(StackTag->getType(), retagMask(AllocaNo)));
 }
+
 
 Value *HWAddressSanitizer::getUARTag(IRBuilder<> &IRB) {
   Value *FramePointerLong = getCachedFP(IRB);
@@ -1643,21 +1856,285 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   SmallVector<Instruction *, 8> LandingPadVec;
   const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
 
+  struct CheckedMemRange {
+    int64_t Offset;
+    uint64_t Size;
+    bool IsWrite;
+  };
+
   memtag::StackInfoBuilder SIB(SSI, DEBUG_TYPE);
-  for (auto &Inst : instructions(F)) {
-    if (InstrumentStack) {
-      SIB.visit(ORE, Inst);
+  const DataLayout &DL = F.getDataLayout();
+  LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+  ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+  DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+
+  struct HoistedLoopCheck {
+    BasicBlock *Preheader;
+    Value *Ptr;
+    uint64_t SpanBytes;
+    bool IsWrite;
+    MaybeAlign Alignment;
+  };
+
+  SmallPtrSet<Instruction *, 16> HoistedLoopAccesses;
+  SmallVector<HoistedLoopCheck, 8> HoistedChecks;
+
+  if (Opt && OptLoops) {
+    for (Loop *L : LI.getLoopsInPreorder()) {
+      BasicBlock *Preheader = L->getLoopPreheader();
+      if (!Preheader)
+        continue;
+
+      // Ensure no deallocations or retagging calls inside the loop
+      bool HasUnsafeCall = false;
+      for (BasicBlock *BB : L->blocks()) {
+        for (Instruction &I : *BB) {
+          if (auto *CB = dyn_cast<CallBase>(&I)) {
+            if (!CB->onlyReadsMemory() && !isa<IntrinsicInst>(&I)) {
+              HasUnsafeCall = true;
+              break;
+            }
+          }
+        }
+        if (HasUnsafeCall)
+          break;
+      }
+      if (HasUnsafeCall)
+        continue;
+
+      const SCEV *BTC = SE.getBackedgeTakenCount(L);
+      if (isa<SCEVCouldNotCompute>(BTC))
+        continue;
+      const SCEVConstant *BTCConst = dyn_cast<SCEVConstant>(BTC);
+      if (!BTCConst)
+        continue;
+      uint64_t Iterations = BTCConst->getAPInt().getZExtValue() + 1;
+      if (Iterations == 0)
+        continue;
+
+      for (BasicBlock *BB : L->blocks()) {
+        for (Instruction &I : *BB) {
+          Value *Ptr = nullptr;
+          bool IsWrite = false;
+          Type *AccessTy = nullptr;
+          MaybeAlign Alignment;
+
+          if (LoadInst *LoadI = dyn_cast<LoadInst>(&I)) {
+            Ptr = LoadI->getPointerOperand();
+            IsWrite = false;
+            AccessTy = LoadI->getType();
+            Alignment = LoadI->getAlign();
+          } else if (StoreInst *StoreI = dyn_cast<StoreInst>(&I)) {
+            Ptr = StoreI->getPointerOperand();
+            IsWrite = true;
+            AccessTy = StoreI->getValueOperand()->getType();
+            Alignment = StoreI->getAlign();
+          } else {
+            continue;
+          }
+
+          const SCEV *PtrSCEV = SE.getSCEV(Ptr);
+          const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(PtrSCEV);
+          if (!AR || AR->getLoop() != L || !AR->isAffine())
+            continue;
+
+          const SCEV *StartSCEV = AR->getStart();
+          const SCEV *StepSCEV = AR->getStepRecurrence(SE);
+          const SCEVConstant *StepConst = dyn_cast<SCEVConstant>(StepSCEV);
+          if (!StepConst)
+            continue;
+
+          int64_t Step = StepConst->getAPInt().getSExtValue();
+          if (Step <= 0)
+            continue;
+
+          uint64_t ElemSizeBytes = DL.getTypeStoreSize(AccessTy);
+          if (ElemSizeBytes == 0)
+            continue;
+
+          uint64_t TotalSpanBytes = (Iterations - 1) * Step + ElemSizeBytes;
+
+          Value *StartPtr = nullptr;
+          if (const SCEVUnknown *SU = dyn_cast<SCEVUnknown>(StartSCEV)) {
+            StartPtr = SU->getValue();
+          } else if (auto *GEP = dyn_cast<GetElementPtrInst>(Ptr)) {
+            if (L->isLoopInvariant(GEP->getPointerOperand()))
+              StartPtr = GEP->getPointerOperand();
+          }
+
+          if (!StartPtr)
+            continue;
+
+          // Do not hoist checks for stack allocas because they will be rewritten and tagged
+          // by stack instrumentation.
+          if (isa<AllocaInst>(StartPtr->stripPointerCasts()))
+            continue;
+
+          if (!L->isLoopInvariant(StartPtr))
+            continue;
+
+          if (auto *I = dyn_cast<Instruction>(StartPtr)) {
+            if (!DT.dominates(I, Preheader->getTerminator()))
+              continue;
+          }
+
+          HoistedLoopAccesses.insert(&I);
+          HoistedChecks.push_back(
+              {Preheader, StartPtr, TotalSpanBytes, IsWrite, Alignment});
+          ++NumHoistedLoopChecks;
+        }
+      }
     }
-
-    if (InstrumentLandingPads && isa<LandingPadInst>(Inst))
-      LandingPadVec.push_back(&Inst);
-
-    getInterestingMemoryOperands(ORE, &Inst, TLI, OperandsToInstrument);
-
-    if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst))
-      if (!ignoreMemIntrinsic(ORE, MI))
-        IntrinToInstrument.push_back(MI);
   }
+
+  SmallPtrSet<Value *, 16> TempsToInstrument;
+
+
+  DenseMap<Value *, SmallVector<CheckedMemRange, 4>> CheckedRanges;
+  for (auto &BB : F) {
+
+    TempsToInstrument.clear();
+    CheckedRanges.clear();
+
+    auto ProcessSegment =
+        [&](SmallVectorImpl<InterestingMemoryOperand> &Segment) {
+          if (Segment.empty())
+            return;
+
+          // Coalescing pass: widen the first access in a contiguous aligned run
+          if (Opt && OptCoalesce) {
+            for (size_t i = 0; i < Segment.size(); ++i) {
+              auto &Op1 = Segment[i];
+              if (Op1.MaybeMask || Op1.TypeStoreSize.isScalable())
+                continue;
+              uint64_t Size1 = Op1.TypeStoreSize.getFixedValue() / 8;
+              if (Size1 == 0 || !isPowerOf2_64(Size1) || Size1 >= 16)
+                continue;
+
+              int64_t Offset1 = 0;
+              Value *Base1 = const_cast<Value *>(
+                  getBaseAndConstantOffset(Op1.getPtr(), DL, Offset1));
+              if (!Base1)
+                continue;
+
+              uint64_t CandidateSpan = Size1;
+              for (size_t j = i + 1; j < Segment.size(); ++j) {
+                auto &Op2 = Segment[j];
+                if (Op2.MaybeMask || Op2.TypeStoreSize.isScalable() ||
+                    Op2.IsWrite != Op1.IsWrite)
+                  continue;
+                uint64_t Size2 = Op2.TypeStoreSize.getFixedValue() / 8;
+                if (Size2 == 0)
+                  continue;
+                int64_t Offset2 = 0;
+                Value *Base2 = const_cast<Value *>(
+                    getBaseAndConstantOffset(Op2.getPtr(), DL, Offset2));
+                if (Base2 != Base1)
+                  continue;
+
+                if (Offset2 == Offset1 + static_cast<int64_t>(CandidateSpan)) {
+                  CandidateSpan += Size2;
+                  if (CandidateSpan <= 16 && isPowerOf2_64(CandidateSpan)) {
+                    Op1.TypeStoreSize = TypeSize::getFixed(CandidateSpan * 8);
+                    ++NumOptimizedAccessesByCoalescing;
+                  }
+                }
+              }
+            }
+          }
+
+          // Instrumentation / Subsumption pass
+          for (auto &Operand : Segment) {
+            if (Operand.MaybeMask) {
+              if (Opt && OptSameTemp && TempsToInstrument.count(Operand.getPtr()))
+                continue;
+              TempsToInstrument.insert(Operand.getPtr());
+              OperandsToInstrument.push_back(Operand);
+              continue;
+            }
+
+            Value *Ptr = Operand.getPtr();
+            int64_t ByteOffset = 0;
+            Value *Base = const_cast<Value *>(
+                getBaseAndConstantOffset(Ptr, DL, ByteOffset));
+            if (!Base)
+              Base = Ptr;
+
+
+            uint64_t AccessSizeBytes = 0;
+            if (!Operand.TypeStoreSize.isScalable())
+              AccessSizeBytes = Operand.TypeStoreSize.getFixedValue() / 8;
+
+            if (Opt && OptSameTemp) {
+              if (!TempsToInstrument.insert(Ptr).second) {
+                ++NumOptimizedAccessesToSameTemp;
+                continue;
+              }
+
+              if (AccessSizeBytes > 0) {
+                if (auto It = CheckedRanges.find(Base);
+                    It != CheckedRanges.end()) {
+                  bool Subsumed = false;
+                  for (const auto &Range : It->second) {
+                    if ((Range.IsWrite || !Operand.IsWrite) &&
+                        Range.Offset <= ByteOffset &&
+                        ByteOffset + AccessSizeBytes <=
+                            Range.Offset + Range.Size) {
+                      Subsumed = true;
+                      break;
+                    }
+                  }
+                  if (Subsumed) {
+                    ++NumOptimizedAccessesToSameTemp;
+                    continue;
+                  }
+                }
+              }
+            }
+
+            if (AccessSizeBytes > 0)
+              CheckedRanges[Base].push_back(
+                  {ByteOffset, AccessSizeBytes, Operand.IsWrite});
+
+            OperandsToInstrument.push_back(Operand);
+          }
+          Segment.clear();
+        };
+
+    SmallVector<InterestingMemoryOperand, 16> SegmentOperands;
+    for (auto &Inst : BB) {
+      if (InstrumentStack) {
+        SIB.visit(ORE, Inst);
+      }
+
+      if (InstrumentLandingPads && isa<LandingPadInst>(Inst))
+        LandingPadVec.push_back(&Inst);
+
+      if (HoistedLoopAccesses.count(&Inst)) {
+        ++NumOptimizedAccessesInLoops;
+        continue;
+      }
+
+      SmallVector<InterestingMemoryOperand, 1> InterestingOperands;
+      getInterestingMemoryOperands(ORE, &Inst, TLI, InterestingOperands);
+
+      if (!InterestingOperands.empty()) {
+        for (auto &Operand : InterestingOperands)
+          SegmentOperands.push_back(Operand);
+      } else if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(&Inst)) {
+        if (!ignoreMemIntrinsic(ORE, MI, TLI))
+          IntrinToInstrument.push_back(MI);
+      }
+
+      if (isa<CallBase>(&Inst)) {
+        ProcessSegment(SegmentOperands);
+        TempsToInstrument.clear();
+        CheckedRanges.clear();
+      }
+    }
+    ProcessSegment(SegmentOperands);
+  }
+
 
   memtag::StackInfo &SInfo = SIB.get();
 
@@ -1674,7 +2151,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
   }
 
   if (SInfo.AllocasToInstrument.empty() && OperandsToInstrument.empty() &&
-      IntrinToInstrument.empty())
+      IntrinToInstrument.empty() && HoistedChecks.empty())
     return;
 
   assert(!ShadowBase);
@@ -1687,9 +2164,7 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
                    !SInfo.AllocasToInstrument.empty());
 
   if (!SInfo.AllocasToInstrument.empty()) {
-    const DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     const PostDominatorTree &PDT = FAM.getResult<PostDominatorTreeAnalysis>(F);
-    const LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
     Value *StackTag = getStackBaseTag(EntryIRB);
     Value *UARTag = getUARTag(EntryIRB);
     instrumentStack(ORE, SInfo, StackTag, UARTag, DT, PDT, LI);
@@ -1708,13 +2183,49 @@ void HWAddressSanitizer::sanitizeFunction(Function &F,
     }
   }
 
-  DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
   PostDominatorTree *PDT = FAM.getCachedResult<PostDominatorTreeAnalysis>(F);
-  LoopInfo *LI = FAM.getCachedResult<LoopAnalysis>(F);
-  DomTreeUpdater DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy);
-  const DataLayout &DL = F.getDataLayout();
+  DomTreeUpdater DTU(const_cast<DominatorTree *>(&DT), PDT,
+                     DomTreeUpdater::UpdateStrategy::Lazy);
+  for (auto &Check : HoistedChecks) {
+    Instruction *InsertBefore = Check.Preheader->getTerminator();
+    IRBuilder<> PreheaderIRB(InsertBefore);
+    if (!UsePageAliases) {
+      if (Check.SpanBytes <= 16 && isPowerOf2_64(Check.SpanBytes) &&
+          (!Check.Alignment ||
+           *Check.Alignment >= Mapping.getObjectAlignment() ||
+           *Check.Alignment >= Check.SpanBytes)) {
+        size_t AccessSizeIndex = TypeSizeToSizeIndex(Check.SpanBytes * 8);
+        if (InstrumentWithCalls) {
+          SmallVector<Value *, 2> Args{
+              PreheaderIRB.CreatePointerCast(Check.Ptr, IntptrTy)};
+          if (UseMatchAllCallback)
+            Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
+          PreheaderIRB.CreateCall(
+              HwasanMemoryAccessCallback[Check.IsWrite][AccessSizeIndex], Args);
+        } else if (OutlinedChecks) {
+          instrumentMemAccessOutline(Check.Ptr, Check.IsWrite, AccessSizeIndex,
+                                     InsertBefore, DTU, &LI);
+        } else {
+          instrumentMemAccessInline(Check.Ptr, Check.IsWrite, AccessSizeIndex,
+                                    InsertBefore, DTU, &LI);
+        }
+      } else {
+        SmallVector<Value *, 3> Args{
+            PreheaderIRB.CreatePointerCast(Check.Ptr, IntptrTy),
+            ConstantInt::get(IntptrTy, Check.SpanBytes)};
+        if (UseMatchAllCallback)
+          Args.emplace_back(ConstantInt::get(Int8Ty, *MatchAllTag));
+        PreheaderIRB.CreateCall(HwasanMemoryAccessCallbackSized[Check.IsWrite],
+                                Args);
+      }
+      untagPointerOperand(InsertBefore, Check.Ptr);
+    }
+  }
   for (auto &Operand : OperandsToInstrument)
-    instrumentMemAccess(Operand, DTU, LI, DL);
+    instrumentMemAccess(Operand, DTU, &LI, DL);
+
+
+
   DTU.flush();
 
   if (ClInstrumentMemIntrinsics && !IntrinToInstrument.empty()) {

@@ -58,7 +58,6 @@ define dso_local noundef i1 @_Z6targetv() sanitize_hwaddress {
 ; CHECK-NEXT:    [[TMP28:%.*]] = lshr i64 [[TMP27]], 4
 ; CHECK-NEXT:    [[TMP29:%.*]] = getelementptr i8, ptr [[TMP14]], i64 [[TMP28]]
 ; CHECK-NEXT:    call void @llvm.memset.p0.i64(ptr align 1 [[TMP29]], i8 [[TMP25]], i64 256, i1 false)
-; CHECK-NEXT:    call void @llvm.hwasan.check.memaccess.shortgranules(ptr [[TMP14]], ptr @stackbuf, i32 19)
 ; CHECK-NEXT:    store ptr [[BUF_HWASAN]], ptr @stackbuf, align 8
 ; CHECK-NEXT:    call void @may_jump()
 ; CHECK-NEXT:    [[TMP30:%.*]] = trunc i64 [[HWASAN_UAR_TAG]] to i8

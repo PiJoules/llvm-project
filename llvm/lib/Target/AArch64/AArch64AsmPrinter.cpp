@@ -157,7 +157,7 @@ public:
   void LowerPATCHABLE_TAIL_CALL(const MachineInstr &MI);
   void LowerPATCHABLE_EVENT_CALL(const MachineInstr &MI, bool Typed);
 
-  typedef std::tuple<unsigned, bool, uint32_t, bool, uint64_t>
+  typedef std::tuple<unsigned, bool, uint32_t, bool, uint64_t, bool>
       HwasanMemaccessTuple;
   std::map<HwasanMemaccessTuple, MCSymbol *> HwasanMemaccessSymbols;
   void LowerKCFI_CHECK(const MachineInstr &MI);
@@ -787,26 +787,44 @@ void AArch64AsmPrinter::LowerHWASAN_CHECK_MEMACCESS(const MachineInstr &MI) {
   if (Reg == AArch64::XZR)
     return;
 
+  bool IsUnaligned =
+      ((MI.getOpcode() == AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED) ||
+       (MI.getOpcode() ==
+        AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_SHORTGRANULES) ||
+       (MI.getOpcode() ==
+        AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_FIXEDSHADOW) ||
+       (MI.getOpcode() ==
+        AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_SHORTGRANULES_FIXEDSHADOW));
   bool IsShort =
       ((MI.getOpcode() == AArch64::HWASAN_CHECK_MEMACCESS_SHORTGRANULES) ||
        (MI.getOpcode() ==
-        AArch64::HWASAN_CHECK_MEMACCESS_SHORTGRANULES_FIXEDSHADOW));
+        AArch64::HWASAN_CHECK_MEMACCESS_SHORTGRANULES_FIXEDSHADOW) ||
+       (MI.getOpcode() ==
+        AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_SHORTGRANULES) ||
+       (MI.getOpcode() ==
+        AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_SHORTGRANULES_FIXEDSHADOW));
   uint32_t AccessInfo = MI.getOperand(1).getImm();
   bool IsFixedShadow =
       ((MI.getOpcode() == AArch64::HWASAN_CHECK_MEMACCESS_FIXEDSHADOW) ||
        (MI.getOpcode() ==
-        AArch64::HWASAN_CHECK_MEMACCESS_SHORTGRANULES_FIXEDSHADOW));
+        AArch64::HWASAN_CHECK_MEMACCESS_SHORTGRANULES_FIXEDSHADOW) ||
+       (MI.getOpcode() ==
+        AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_FIXEDSHADOW) ||
+       (MI.getOpcode() ==
+        AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_SHORTGRANULES_FIXEDSHADOW));
   uint64_t FixedShadowOffset = IsFixedShadow ? MI.getOperand(2).getImm() : 0;
 
   MCSymbol *&Sym = HwasanMemaccessSymbols[HwasanMemaccessTuple(
-      Reg, IsShort, AccessInfo, IsFixedShadow, FixedShadowOffset)];
+      Reg, IsShort, AccessInfo, IsFixedShadow, FixedShadowOffset, IsUnaligned)];
   if (!Sym) {
     // FIXME: Make this work on non-ELF.
     if (!TM.getTargetTriple().isOSBinFormatELF())
       report_fatal_error("llvm.hwasan.check.memaccess only supported on ELF");
 
-    std::string SymName = "__hwasan_check_x" + utostr(Reg - AArch64::X0) + "_" +
-                          utostr(AccessInfo);
+    std::string SymName = "__hwasan_check_";
+    if (IsUnaligned)
+      SymName += "unaligned_";
+    SymName += "x" + utostr(Reg - AArch64::X0) + "_" + utostr(AccessInfo);
     if (IsFixedShadow)
       SymName += "_fixed_" + utostr(FixedShadowOffset);
     if (IsShort)
@@ -848,6 +866,7 @@ void AArch64AsmPrinter::emitHwasanMemaccessSymbols(Module &M) {
     uint32_t AccessInfo = std::get<2>(P.first);
     bool IsFixedShadow = std::get<3>(P.first);
     uint64_t FixedShadowOffset = std::get<4>(P.first);
+    bool IsUnaligned = std::get<5>(P.first);
     const MCSymbolRefExpr *HwasanTagMismatchRef =
         IsShort ? HwasanTagMismatchV2Ref : HwasanTagMismatchV1Ref;
     MCSymbol *Sym = P.second;
@@ -871,115 +890,328 @@ void AArch64AsmPrinter::emitHwasanMemaccessSymbols(Module &M) {
     OutStreamer->emitSymbolAttribute(Sym, MCSA_Hidden);
     OutStreamer->emitLabel(Sym);
 
-    EmitToStreamer(MCInstBuilder(AArch64::SBFMXri)
-                       .addReg(AArch64::X16)
-                       .addReg(Reg)
-                       .addImm(4)
-                       .addImm(55));
-
-    if (IsFixedShadow) {
-      // Aarch64 makes it difficult to embed large constants in the code.
-      // Fortuitously, kShadowBaseAlignment == 32, so we use the 32-bit
-      // left-shift option in the MOV instruction. Combined with the 16-bit
-      // immediate, this is enough to represent any offset up to 2**48.
-      emitMOVZ(AArch64::X17, FixedShadowOffset >> 32, 32);
-      EmitToStreamer(MCInstBuilder(AArch64::LDRBBroX)
-                         .addReg(AArch64::W16)
-                         .addReg(AArch64::X17)
+    auto emitLoadShadow = [&](Register DstReg, Register AddrReg) {
+      EmitToStreamer(MCInstBuilder(AArch64::SBFMXri)
                          .addReg(AArch64::X16)
-                         .addImm(0)
-                         .addImm(0));
-    } else {
-      EmitToStreamer(MCInstBuilder(AArch64::LDRBBroX)
-                         .addReg(AArch64::W16)
-                         .addReg(IsShort ? AArch64::X20 : AArch64::X9)
-                         .addReg(AArch64::X16)
-                         .addImm(0)
-                         .addImm(0));
-    }
+                         .addReg(AddrReg)
+                         .addImm(4)
+                         .addImm(55));
+      if (IsFixedShadow) {
+        // Aarch64 makes it difficult to embed large constants in the code.
+        // Fortuitously, kShadowBaseAlignment == 32, so we use the 32-bit
+        // left-shift option in the MOV instruction. Combined with the 16-bit
+        // immediate, this is enough to represent any offset up to 2**48.
+        emitMOVZ(AArch64::X17, FixedShadowOffset >> 32, 32);
+        EmitToStreamer(MCInstBuilder(AArch64::LDRBBroX)
+                           .addReg(DstReg)
+                           .addReg(AArch64::X17)
+                           .addReg(AArch64::X16)
+                           .addImm(0)
+                           .addImm(0));
+      } else {
+        EmitToStreamer(MCInstBuilder(AArch64::LDRBBroX)
+                           .addReg(DstReg)
+                           .addReg(IsShort ? AArch64::X20 : AArch64::X9)
+                           .addReg(AArch64::X16)
+                           .addImm(0)
+                           .addImm(0));
+      }
+    };
 
-    EmitToStreamer(MCInstBuilder(AArch64::SUBSXrs)
-                       .addReg(AArch64::XZR)
-                       .addReg(AArch64::X16)
-                       .addReg(Reg)
-                       .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 56)));
-    MCSymbol *HandleMismatchOrPartialSym = OutContext.createTempSymbol();
-    EmitToStreamer(MCInstBuilder(AArch64::Bcc)
-                       .addImm(AArch64CC::NE)
-                       .addExpr(MCSymbolRefExpr::create(
-                           HandleMismatchOrPartialSym, OutContext)));
-    MCSymbol *ReturnSym = OutContext.createTempSymbol();
-    OutStreamer->emitLabel(ReturnSym);
-    EmitToStreamer(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
-    OutStreamer->emitLabel(HandleMismatchOrPartialSym);
+    if (!IsUnaligned) {
+      emitLoadShadow(AArch64::W16, Reg);
 
-    if (HasMatchAllTag) {
-      EmitToStreamer(MCInstBuilder(AArch64::UBFMXri)
-                         .addReg(AArch64::X17)
-                         .addReg(Reg)
-                         .addImm(56)
-                         .addImm(63));
-      EmitToStreamer(MCInstBuilder(AArch64::SUBSXri)
+      EmitToStreamer(MCInstBuilder(AArch64::SUBSXrs)
                          .addReg(AArch64::XZR)
-                         .addReg(AArch64::X17)
-                         .addImm(MatchAllTag)
-                         .addImm(0));
-      EmitToStreamer(
-          MCInstBuilder(AArch64::Bcc)
-              .addImm(AArch64CC::EQ)
-              .addExpr(MCSymbolRefExpr::create(ReturnSym, OutContext)));
-    }
+                         .addReg(AArch64::X16)
+                         .addReg(Reg)
+                         .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 56)));
+      MCSymbol *HandleMismatchOrPartialSym = OutContext.createTempSymbol();
+      EmitToStreamer(MCInstBuilder(AArch64::Bcc)
+                         .addImm(AArch64CC::NE)
+                         .addExpr(MCSymbolRefExpr::create(
+                             HandleMismatchOrPartialSym, OutContext)));
+      MCSymbol *ReturnSym = OutContext.createTempSymbol();
+      OutStreamer->emitLabel(ReturnSym);
+      EmitToStreamer(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+      OutStreamer->emitLabel(HandleMismatchOrPartialSym);
 
-    if (IsShort) {
-      EmitToStreamer(MCInstBuilder(AArch64::SUBSWri)
-                         .addReg(AArch64::WZR)
-                         .addReg(AArch64::W16)
-                         .addImm(15)
-                         .addImm(0));
+      if (HasMatchAllTag) {
+        EmitToStreamer(MCInstBuilder(AArch64::UBFMXri)
+                           .addReg(AArch64::X17)
+                           .addReg(Reg)
+                           .addImm(56)
+                           .addImm(63));
+        EmitToStreamer(MCInstBuilder(AArch64::SUBSXri)
+                           .addReg(AArch64::XZR)
+                           .addReg(AArch64::X17)
+                           .addImm(MatchAllTag)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::EQ)
+                .addExpr(MCSymbolRefExpr::create(ReturnSym, OutContext)));
+      }
+
+      if (IsShort) {
+        EmitToStreamer(MCInstBuilder(AArch64::SUBSWri)
+                           .addReg(AArch64::WZR)
+                           .addReg(AArch64::W16)
+                           .addImm(15)
+                           .addImm(0));
+        MCSymbol *HandleMismatchSym = OutContext.createTempSymbol();
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::HI)
+                .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+
+        EmitToStreamer(MCInstBuilder(AArch64::ANDXri)
+                           .addReg(AArch64::X17)
+                           .addReg(Reg)
+                           .addImm(AArch64_AM::encodeLogicalImmediate(0xf, 64)));
+        if (Size != 1)
+          EmitToStreamer(MCInstBuilder(AArch64::ADDXri)
+                             .addReg(AArch64::X17)
+                             .addReg(AArch64::X17)
+                             .addImm(Size - 1)
+                             .addImm(0));
+        EmitToStreamer(MCInstBuilder(AArch64::SUBSWrs)
+                           .addReg(AArch64::WZR)
+                           .addReg(AArch64::W16)
+                           .addReg(AArch64::W17)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::LS)
+                .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+
+        EmitToStreamer(MCInstBuilder(AArch64::ORRXri)
+                           .addReg(AArch64::X16)
+                           .addReg(Reg)
+                           .addImm(AArch64_AM::encodeLogicalImmediate(0xf, 64)));
+        EmitToStreamer(MCInstBuilder(AArch64::LDRBBui)
+                           .addReg(AArch64::W16)
+                           .addReg(AArch64::X16)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::SUBSXrs)
+                .addReg(AArch64::XZR)
+                .addReg(AArch64::X16)
+                .addReg(Reg)
+                .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 56)));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::EQ)
+                .addExpr(MCSymbolRefExpr::create(ReturnSym, OutContext)));
+
+        OutStreamer->emitLabel(HandleMismatchSym);
+      }
+    } else {
+      // Unaligned check logic: handles single-granule and boundary-crossing accesses
+      MCSymbol *ReturnSym = OutContext.createTempSymbol();
       MCSymbol *HandleMismatchSym = OutContext.createTempSymbol();
-      EmitToStreamer(
-          MCInstBuilder(AArch64::Bcc)
-              .addImm(AArch64CC::HI)
-              .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+      emitLoadShadow(AArch64::W16, Reg);
 
+      EmitToStreamer(MCInstBuilder(AArch64::SUBSXrs)
+                         .addReg(AArch64::XZR)
+                         .addReg(AArch64::X16)
+                         .addReg(Reg)
+                         .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 56)));
+      MCSymbol *Granule1MismatchSym = OutContext.createTempSymbol();
+      EmitToStreamer(MCInstBuilder(AArch64::Bcc)
+                         .addImm(AArch64CC::NE)
+                         .addExpr(MCSymbolRefExpr::create(
+                             Granule1MismatchSym, OutContext)));
+
+      // Granule 1 tag matched. Check if (Reg & 15) + Size <= 16.
       EmitToStreamer(MCInstBuilder(AArch64::ANDXri)
                          .addReg(AArch64::X17)
                          .addReg(Reg)
                          .addImm(AArch64_AM::encodeLogicalImmediate(0xf, 64)));
-      if (Size != 1)
-        EmitToStreamer(MCInstBuilder(AArch64::ADDXri)
-                           .addReg(AArch64::X17)
-                           .addReg(AArch64::X17)
-                           .addImm(Size - 1)
-                           .addImm(0));
-      EmitToStreamer(MCInstBuilder(AArch64::SUBSWrs)
+      EmitToStreamer(MCInstBuilder(AArch64::ADDXri)
+                         .addReg(AArch64::X17)
+                         .addReg(AArch64::X17)
+                         .addImm(Size)
+                         .addImm(0));
+      EmitToStreamer(MCInstBuilder(AArch64::SUBSWri)
                          .addReg(AArch64::WZR)
-                         .addReg(AArch64::W16)
                          .addReg(AArch64::W17)
+                         .addImm(16)
                          .addImm(0));
       EmitToStreamer(
           MCInstBuilder(AArch64::Bcc)
               .addImm(AArch64CC::LS)
-              .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+              .addExpr(MCSymbolRefExpr::create(ReturnSym, OutContext)));
 
-      EmitToStreamer(MCInstBuilder(AArch64::ORRXri)
+      // Access spans into Granule 2: check shadow tag at address Reg + Size - 1.
+      EmitToStreamer(MCInstBuilder(AArch64::ADDXri)
+                         .addReg(AArch64::X17)
+                         .addReg(Reg)
+                         .addImm(Size - 1)
+                         .addImm(0));
+      emitLoadShadow(AArch64::W16, AArch64::X17);
+      EmitToStreamer(MCInstBuilder(AArch64::SUBSXrs)
+                         .addReg(AArch64::XZR)
                          .addReg(AArch64::X16)
                          .addReg(Reg)
-                         .addImm(AArch64_AM::encodeLogicalImmediate(0xf, 64)));
-      EmitToStreamer(MCInstBuilder(AArch64::LDRBBui)
-                         .addReg(AArch64::W16)
-                         .addReg(AArch64::X16)
-                         .addImm(0));
-      EmitToStreamer(
-          MCInstBuilder(AArch64::SUBSXrs)
-              .addReg(AArch64::XZR)
-              .addReg(AArch64::X16)
-              .addReg(Reg)
-              .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 56)));
+                         .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 56)));
       EmitToStreamer(
           MCInstBuilder(AArch64::Bcc)
               .addImm(AArch64CC::EQ)
               .addExpr(MCSymbolRefExpr::create(ReturnSym, OutContext)));
+
+      if (IsShort) {
+        // Granule 2 might be a short granule.
+        EmitToStreamer(MCInstBuilder(AArch64::SUBSWri)
+                           .addReg(AArch64::WZR)
+                           .addReg(AArch64::W16)
+                           .addImm(15)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::HI)
+                .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+
+        EmitToStreamer(MCInstBuilder(AArch64::ADDXri)
+                           .addReg(AArch64::X17)
+                           .addReg(Reg)
+                           .addImm(Size - 1)
+                           .addImm(0));
+        EmitToStreamer(MCInstBuilder(AArch64::ANDXri)
+                           .addReg(AArch64::X17)
+                           .addReg(AArch64::X17)
+                           .addImm(AArch64_AM::encodeLogicalImmediate(0xf, 64)));
+        EmitToStreamer(MCInstBuilder(AArch64::SUBSWrs)
+                           .addReg(AArch64::WZR)
+                           .addReg(AArch64::W16)
+                           .addReg(AArch64::W17)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::LS)
+                .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+
+        EmitToStreamer(MCInstBuilder(AArch64::ADDXri)
+                           .addReg(AArch64::X16)
+                           .addReg(Reg)
+                           .addImm(Size - 1)
+                           .addImm(0));
+        EmitToStreamer(MCInstBuilder(AArch64::ORRXri)
+                           .addReg(AArch64::X16)
+                           .addReg(AArch64::X16)
+                           .addImm(AArch64_AM::encodeLogicalImmediate(0xf, 64)));
+        EmitToStreamer(MCInstBuilder(AArch64::LDRBBui)
+                           .addReg(AArch64::W16)
+                           .addReg(AArch64::X16)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::SUBSXrs)
+                .addReg(AArch64::XZR)
+                .addReg(AArch64::X16)
+                .addReg(Reg)
+                .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 56)));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::EQ)
+                .addExpr(MCSymbolRefExpr::create(ReturnSym, OutContext)));
+      }
+      EmitToStreamer(
+          MCInstBuilder(AArch64::B)
+              .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+
+      OutStreamer->emitLabel(ReturnSym);
+      EmitToStreamer(MCInstBuilder(AArch64::RET).addReg(AArch64::LR));
+
+      OutStreamer->emitLabel(Granule1MismatchSym);
+      if (HasMatchAllTag) {
+        EmitToStreamer(MCInstBuilder(AArch64::UBFMXri)
+                           .addReg(AArch64::X17)
+                           .addReg(Reg)
+                           .addImm(56)
+                           .addImm(63));
+        EmitToStreamer(MCInstBuilder(AArch64::SUBSXri)
+                           .addReg(AArch64::XZR)
+                           .addReg(AArch64::X17)
+                           .addImm(MatchAllTag)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::EQ)
+                .addExpr(MCSymbolRefExpr::create(ReturnSym, OutContext)));
+      }
+
+      if (IsShort) {
+        // If Granule 1 tag didn't match and access crosses into Granule 2,
+        // Granule 1 cannot be a valid short granule since it spans through byte 15.
+        EmitToStreamer(MCInstBuilder(AArch64::ANDXri)
+                           .addReg(AArch64::X17)
+                           .addReg(Reg)
+                           .addImm(AArch64_AM::encodeLogicalImmediate(0xf, 64)));
+        EmitToStreamer(MCInstBuilder(AArch64::ADDXri)
+                           .addReg(AArch64::X17)
+                           .addReg(AArch64::X17)
+                           .addImm(Size)
+                           .addImm(0));
+        EmitToStreamer(MCInstBuilder(AArch64::SUBSWri)
+                           .addReg(AArch64::WZR)
+                           .addReg(AArch64::W17)
+                           .addImm(16)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::HI)
+                .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+
+        // Within Granule 1: check short granule.
+        EmitToStreamer(MCInstBuilder(AArch64::SUBSWri)
+                           .addReg(AArch64::WZR)
+                           .addReg(AArch64::W16)
+                           .addImm(15)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::HI)
+                .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+
+        EmitToStreamer(MCInstBuilder(AArch64::ANDXri)
+                           .addReg(AArch64::X17)
+                           .addReg(Reg)
+                           .addImm(AArch64_AM::encodeLogicalImmediate(0xf, 64)));
+        if (Size != 1)
+          EmitToStreamer(MCInstBuilder(AArch64::ADDXri)
+                             .addReg(AArch64::X17)
+                             .addReg(AArch64::X17)
+                             .addImm(Size - 1)
+                             .addImm(0));
+        EmitToStreamer(MCInstBuilder(AArch64::SUBSWrs)
+                           .addReg(AArch64::WZR)
+                           .addReg(AArch64::W16)
+                           .addReg(AArch64::W17)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::LS)
+                .addExpr(MCSymbolRefExpr::create(HandleMismatchSym, OutContext)));
+
+        EmitToStreamer(MCInstBuilder(AArch64::ORRXri)
+                           .addReg(AArch64::X16)
+                           .addReg(Reg)
+                           .addImm(AArch64_AM::encodeLogicalImmediate(0xf, 64)));
+        EmitToStreamer(MCInstBuilder(AArch64::LDRBBui)
+                           .addReg(AArch64::W16)
+                           .addReg(AArch64::X16)
+                           .addImm(0));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::SUBSXrs)
+                .addReg(AArch64::XZR)
+                .addReg(AArch64::X16)
+                .addReg(Reg)
+                .addImm(AArch64_AM::getShifterImm(AArch64_AM::LSR, 56)));
+        EmitToStreamer(
+            MCInstBuilder(AArch64::Bcc)
+                .addImm(AArch64CC::EQ)
+                .addExpr(MCSymbolRefExpr::create(ReturnSym, OutContext)));
+      }
 
       OutStreamer->emitLabel(HandleMismatchSym);
     }
@@ -3767,6 +3999,10 @@ void AArch64AsmPrinter::emitInstruction(const MachineInstr *MI) {
   case AArch64::HWASAN_CHECK_MEMACCESS_SHORTGRANULES:
   case AArch64::HWASAN_CHECK_MEMACCESS_FIXEDSHADOW:
   case AArch64::HWASAN_CHECK_MEMACCESS_SHORTGRANULES_FIXEDSHADOW:
+  case AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED:
+  case AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_SHORTGRANULES:
+  case AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_FIXEDSHADOW:
+  case AArch64::HWASAN_CHECK_MEMACCESS_UNALIGNED_SHORTGRANULES_FIXEDSHADOW:
     LowerHWASAN_CHECK_MEMACCESS(*MI);
     return;
 

@@ -2861,6 +2861,30 @@ def int_hwasan_check_memaccess_shortgranules_fixedshadow :
   Intrinsic<[], [llvm_ptr_ty, llvm_i32_ty, llvm_i64_ty],
             [ImmArg<ArgIndex<1>>, ImmArg<ArgIndex<2>>]>;
 
+// Variant 5) supports unaligned accesses
+// Parameters: same as Variant 1
+def int_hwasan_check_memaccess_unaligned :
+  Intrinsic<[], [llvm_ptr_ty, llvm_ptr_ty, llvm_i32_ty],
+            [ImmArg<ArgIndex<2>>]>;
+
+// Variant 6) supports unaligned accesses and short granule checks
+// Parameters: same as Variant 1
+def int_hwasan_check_memaccess_unaligned_shortgranules :
+  Intrinsic<[], [llvm_ptr_ty, llvm_ptr_ty, llvm_i32_ty],
+            [ImmArg<ArgIndex<2>>]>;
+
+// Variant 7) supports unaligned accesses and assumes a fixed shadow offset
+// Parameters: same as Variant 3
+def int_hwasan_check_memaccess_unaligned_fixedshadow :
+  Intrinsic<[], [llvm_ptr_ty, llvm_i32_ty, llvm_i64_ty],
+            [ImmArg<ArgIndex<1>>, ImmArg<ArgIndex<2>>]>;
+
+// Variant 8) supports unaligned accesses, short granule checks, and assumes a fixed shadow offset
+// Parameters: same as Variant 3
+def int_hwasan_check_memaccess_unaligned_shortgranules_fixedshadow :
+  Intrinsic<[], [llvm_ptr_ty, llvm_i32_ty, llvm_i64_ty],
+            [ImmArg<ArgIndex<1>>, ImmArg<ArgIndex<2>>]>;
+
 // Xray intrinsics
 //===----------------------------------------------------------------------===//
 // Custom event logging for x-ray.

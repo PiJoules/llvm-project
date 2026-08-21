@@ -182,8 +182,7 @@ define void @test_store_unaligned(ptr %a, i64 %b) sanitize_hwaddress {
 ; CHECK-SAME: (ptr [[A:%.*]], i64 [[B:%.*]]) #[[ATTR0]] {
 ; CHECK-NEXT:  entry:
 ; CHECK-NEXT:    [[DOTHWASAN_SHADOW:%.*]] = call ptr asm "", "=r,0"(ptr inttoptr (i64 4398046511104 to ptr))
-; CHECK-NEXT:    [[TMP0:%.*]] = ptrtoint ptr [[A]] to i64
-; CHECK-NEXT:    call void @__hwasan_storeN(i64 [[TMP0]], i64 8)
+; CHECK-NEXT:    call void @llvm.hwasan.check.memaccess.unaligned.shortgranules.fixedshadow(ptr [[A]], i32 19, i64 4398046511104)
 ; CHECK-NEXT:    store i64 [[B]], ptr [[A]], align 4
 ; CHECK-NEXT:    ret void
 ;
